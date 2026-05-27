@@ -43,6 +43,9 @@ import { formsRouter } from './routes/forms.ts';
 import { webhooksRouter } from './routes/webhooks.js';
 import { webhookHandlersRouter } from './routes/webhookHandlers.js';
 import { startJobs, getJobScheduler } from './jobs/index.js';
+import { batchProcessor } from './services/batch.js';
+import { featureFlags } from './config/featureFlags.js';
+import { getRedisCache } from './middleware/cache.js';
 import { errorHandler, notFoundHandler, AppError } from './middleware/errorHandler.js';
 import { messageQueue } from './services/queue.js';
 import { registerDefaultProcessors } from './services/queue-producers.js';
@@ -57,6 +60,7 @@ import { backupRouter } from './routes/backup.js';
 import { pushRouter } from './routes/push.js';
 import { ipAllowlistRouter } from './routes/ip-allowlist.js';
 import { nfcRouter } from './routes/nfc.js';
+import { cacheRouter } from './routes/cache.js';
 import { ipAllowlistMiddleware, initIpAllowlist } from './middleware/ip-allowlist.js';
 import { sessionsRouter } from './routes/sessions.js';
 import { sessionMiddleware } from './middleware/session.js';
@@ -269,6 +273,8 @@ apiV1Router.use('/ip-allowlist', ipAllowlistRouter);
 apiV1Router.use('/push', pushRouter);
 // NFC / QR payment requests
 apiV1Router.use('/nfc', nfcRouter);
+// Cache management
+apiV1Router.use('/cache', cacheRouter);
 
 app.use('/api/v1', ipAllowlistMiddleware(), apiV1Router);
 
@@ -357,13 +363,23 @@ setInterval(async () => {
   if (count > 0) console.log(`Escalated ${count} disputes`);
 }, 5 * 60 * 1000);
 
+if (featureFlags.evaluate('batch-operations')) {
+  batchProcessor.start();
+  console.log('[BatchProcessor] Started');
+}
+
+getRedisCache().connect().then(() => {
+  console.log('[RedisCache] Connection initialized');
+}).catch(() => {
+  console.log('[RedisCache] Not available, using in-memory cache only');
+});
+
 const server = http.createServer(app);
 const wsServer = attachWebSocketServer({ server, options: { path: '/ws' } });
 bindWebSocketServer(wsServer);
 app.use('/api/v1/websocket', createWebSocketRouter(wsServer));
 app.use('/api/v1/analytics', createAnalyticsRouter(wsServer));
 
-// Broadcast analytics snapshot every 30 seconds to all connected WebSocket clients
 const analyticsInterval = setInterval(() => {
   wsServer.broadcastToChannel('analytics.updates', { type: 'analytics:update', payload: analyticsService.snapshot() });
 }, 30_000);
@@ -396,6 +412,13 @@ const shutdown = (signal: string) => {
       console.log('Message queue stopped.');
     } catch (err) {
       console.error('Error stopping message queue:', err);
+    }
+
+    try {
+      batchProcessor.stop();
+      console.log('Batch processor stopped.');
+    } catch (err) {
+      console.error('Error stopping batch processor:', err);
     }
 
     clearInterval(analyticsInterval);

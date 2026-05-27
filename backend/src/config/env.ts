@@ -27,6 +27,11 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: z.string().default(''),
   STRIPE_WEBHOOK_SECRET: z.string().default(''),
   STRIPE_PUBLISHABLE_KEY: z.string().default(''),
+  REDIS_URL: z.string().default(''),
+  REDIS_ENABLED: z.coerce.string().transform((val) => val === 'true').default('false'),
+  CACHE_WARMING_ENABLED: z.coerce.string().transform((val) => val === 'true').default('false'),
+  DB_QUERY_LOGGING_ENABLED: z.coerce.string().transform((val) => val === 'true').default('false'),
+  DB_SLOW_QUERY_THRESHOLD_MS: z.coerce.number().default(100),
 });
 
 export type Env = z.infer<typeof envSchema>;
