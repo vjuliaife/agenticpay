@@ -1,30 +1,11 @@
 import express, { Request, Response, NextFunction } from 'express';
 import * as Sentry from '@sentry/node';
-import { nodeProfilingIntegration } from '@sentry/profiling-node';
-
-Sentry.init({
-  dsn: process.env.SENTRY_DSN || '',
-  integrations: [
-    nodeProfilingIntegration(),
-  ],
-  tracesSampleRate: 1.0,
-  profilesSampleRate: 1.0,
-  environment: process.env.NODE_ENV || 'development',
-  beforeSend(event, hint) {
-    if (event.exception && hint.originalException) {
-      const error = hint.originalException as Error;
-      if (error && error.message && error.message.includes('Database connection timeout')) {
-        event.fingerprint = ['database-timeout'];
-      }
-    }
-    return event;
-  }
-});
 import cors from 'cors';
 import { tokenBucketRateLimit } from './middleware/rate-limit.js';
 import { compressionMiddleware, getCompressionMetrics } from './middleware/compression.js';
 import { poolMetrics } from './config/database.js';
 import { config } from './config.js';
+import { versionMiddleware } from './middleware/versioning.js';
 import { verificationRouter } from './routes/verification.js';
 import { invoiceRouter } from './routes/invoice.js';
 import { stellarRouter } from './routes/stellar.js';
@@ -54,7 +35,6 @@ import { requestIdMiddleware, REQUEST_ID_HEADER } from './middleware/requestId.j
 import { httpLogger, correlationMiddleware } from './middleware/logger.js';
 import { validateEnv, config as getConfig } from './config/env.js';
 import { flagsRouter } from './routes/flags.js';
-import { rateLimitAnalyticsRouter } from './routes/rate-limit-analytics.js';
 import { emailRouter } from './routes/email.js';
 import { portfolioRouter } from './routes/portfolio.js';
 import { backupRouter } from './routes/backup.js';
@@ -63,19 +43,18 @@ import { ipAllowlistRouter } from './routes/ip-allowlist.js';
 import { nfcRouter } from './routes/nfc.js';
 import { cacheRouter } from './routes/cache.js';
 import { ipAllowlistMiddleware, initIpAllowlist } from './middleware/ip-allowlist.js';
-import { sessionsRouter } from './routes/sessions.js';
 import { sessionMiddleware } from './middleware/session.js';
 import { notificationsRouter } from './routes/notifications.js';
 import { auditRouter } from './routes/audit.js';
 import { hedgingRouter } from './routes/hedging.js';
 import { complianceRouter } from './routes/compliance.js';
+import { gdprRouter } from './routes/gdpr.js';
 import { kybRouter } from './routes/kyb.js';
 import { batchRouter } from './routes/batch.js';
 import { relayerRouter } from './routes/relayer.js';
 import { paymentQueueRouter } from './routes/payment-queue.js';
 import { disputeRoutes } from './disputes/index.js';
 import { disputeService } from './disputes/disputeService.js';
-import http from 'node:http';
 import { attachWebSocketServer } from './websocket/server.js';
 import { createWebSocketRouter } from './routes/websocket.js';
 import { bindWebSocketServer } from './events/event-bus.js';
@@ -120,10 +99,26 @@ import zkIdentityRouter from './routes/zk-identity.js';
 validateEnv();
 const env = getConfig();
 
-// Initialize sandbox services
-const sandboxManager = new SandboxManager(env.NODE_ENV || 'development');
-const mockPaymentProcessor = new MockPaymentProcessor();
-const testDataSeeder = new TestDataSeeder();
+// ── Lazy sandbox service initialization ───────────────────────────────────────
+// SandboxManager, MockPaymentProcessor, and TestDataSeeder are only needed in
+// development/sandbox environments. Deferring their construction avoids paying
+// the instantiation cost on every cold start in production.
+let _sandboxManager: InstanceType<typeof SandboxManager> | null = null;
+let _mockPaymentProcessor: InstanceType<typeof MockPaymentProcessor> | null = null;
+let _testDataSeeder: InstanceType<typeof TestDataSeeder> | null = null;
+
+function getSandboxManager(): InstanceType<typeof SandboxManager> {
+  if (!_sandboxManager) _sandboxManager = new SandboxManager(env.NODE_ENV || 'development');
+  return _sandboxManager;
+}
+function getMockPaymentProcessor(): InstanceType<typeof MockPaymentProcessor> {
+  if (!_mockPaymentProcessor) _mockPaymentProcessor = new MockPaymentProcessor();
+  return _mockPaymentProcessor;
+}
+function getTestDataSeeder(): InstanceType<typeof TestDataSeeder> {
+  if (!_testDataSeeder) _testDataSeeder = new TestDataSeeder();
+  return _testDataSeeder;
+}
 
 // Initialize IP allowlist from environment
 if (env.IP_ALLOWLIST_ENABLED || env.IP_ALLOWLIST) {
@@ -202,7 +197,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(healthRouter);
 app.use('/docs', docsRouter);
 
-import { versionMiddleware } from './middleware/versioning.js';
+// Cold start monitoring dashboard — available before auth/rate-limit middleware
+app.use('/api/v1/cold-start', coldStartMonitorRouter);
 
 app.use('/api/', apiRateLimiter);
 
@@ -303,7 +299,7 @@ app.use('/api/v1/tax', taxRouter);
 app.use('/api/v1/projects', projectsRouter);
 
 // Sandbox environment for testing (with relaxed rate limits)
-const sandboxRouter = createSandboxRouter(sandboxManager, mockPaymentProcessor, testDataSeeder);
+const sandboxRouter = createSandboxRouter(getSandboxManager(), getMockPaymentProcessor(), getTestDataSeeder());
 app.use('/api/v1/sandbox', sandboxRateLimiter, sandboxRouter);
 
 // Email system v2 with templates, analytics, and localization
@@ -388,6 +384,59 @@ const analyticsInterval = setInterval(() => {
 server.listen(config.server.port, () => {
   console.log(`AgenticPay backend running on port ${config.server.port} [${config.env}]`);
   console.log(`WebSocket server listening on path /ws (max ${wsServer.metrics.activeConnections}/${wsServer.metrics.acceptedConnections})`);
+
+  // ── Deferred startup: run after the server is accepting requests ────────────
+  // These services are not needed to serve the first request. Starting them
+  // after listen() means the process is ready to handle traffic immediately,
+  // and the background work happens concurrently without blocking the hot path.
+  setImmediate(() => {
+    // Load Sentry profiling integration now that the process is warm
+    loadProfilingIntegration();
+
+    // Job scheduler
+    if (config.jobs.enabled) {
+      startJobs();
+
+      createBullMQScheduler(getScheduledTasks()).then((scheduler) => {
+        if (scheduler) {
+          console.log('[bullmq] Distributed scheduler active');
+        } else {
+          console.log('[scheduler] Using in-process node-cron (Redis not configured)');
+        }
+      }).catch((err) => {
+        console.error('[bullmq] Scheduler startup error:', err);
+      });
+    }
+
+    // Queue processors
+    registerDefaultProcessors();
+    if (config.queue.enabled) {
+      messageQueue.start();
+      paymentQueue.start();
+    }
+
+    // Webhook worker
+    startWebhookWorker();
+
+    // Auto-escalation cron
+    setInterval(async () => {
+      const count = await disputeService.processEscalations();
+      if (count > 0) console.log(`Escalated ${count} disputes`);
+    }, 5 * 60 * 1000);
+
+    // Batch processor
+    if (featureFlags.evaluate('batch-operations')) {
+      batchProcessor.start();
+      console.log('[BatchProcessor] Started');
+    }
+
+    // Redis cache connection (non-blocking — falls back to in-memory)
+    getRedisCache().connect().then(() => {
+      console.log('[RedisCache] Connection initialized');
+    }).catch(() => {
+      console.log('[RedisCache] Not available, using in-memory cache only');
+    });
+  });
 });
 
 const shutdown = (signal: string) => {
